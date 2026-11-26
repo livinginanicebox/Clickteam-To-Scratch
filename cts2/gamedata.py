@@ -179,6 +179,7 @@ class _ObjectProps:
     strings: List[str] = field(default_factory=list)
     movements: List[Movement] = field(default_factory=list)
     counter: Optional[Tuple[int, int, int]] = None  # initial, min, max
+    counter_images: List[int] = field(default_factory=list)
     image: Optional[int] = None
     fill_color: Optional[Tuple[int, int, int, int]] = None
     width: int = 0
@@ -574,34 +575,37 @@ def _read_chunk_list(r: Reader) -> List[_Chunk]:
 def _read_animations(r: Reader) -> List[Animation]:
     start = r.tell()
     r.i16()  # header size
-    count = r.i16()
+    count = r.u16()
     if count <= 0 or count > 4096:
         return []
-    offsets = [r.i16() for _ in range(count)]
+    offsets = [r.u16() for _ in range(count)]
     animations: List[Animation] = []
     for i, off in enumerate(offsets):
         anim = Animation(name=str(i))
-        if off <= 0:
+        if off <= 0 or start + off >= len(r):
             animations.append(anim)
             continue
         try:
             r.seek(start + off)
-            dir_offsets = [r.i16() for _ in range(32)]
+            dir_offsets = [r.u16() for _ in range(32)]
             for j, doff in enumerate(dir_offsets):
-                if doff <= 0:
+                if doff <= 0 or start + off + doff >= len(r):
                     continue
                 r.seek(start + off + doff)
-                if r.remaining() < 6:
+                if r.remaining() < 8:
                     continue
                 min_speed = r.i8()
                 max_speed = r.i8()
                 repeat = r.i16()
                 back_to = r.i16()
                 frame_count = r.u16()
-                frames = [r.i16() for _ in range(min(frame_count, 65536))]
+                if frame_count * 2 > r.remaining():
+                    frame_count = r.remaining() // 2
+                raw_frames = [r.u16() for _ in range(min(frame_count, 65536))]
+                frames = [f for f in raw_frames if f != 0xFFFF]
                 anim.directions.append(
                     AnimationDirection(j, min_speed, max_speed, repeat, back_to,
-                                        [f for f in frames if f != -1])
+                                       frames)
                 )
         except Exception:  # noqa: BLE001
             continue
@@ -654,14 +658,29 @@ def _read_movements(r: Reader, unicode: bool) -> List[Movement]:
     return out
 
 
-def _read_counter(r: Reader) -> Optional[Tuple[int, int, int]]:
+def _read_counter(r: Reader) -> Tuple[Optional[Tuple[int, int, int]], List[int]]:
     if r.remaining() < 14:
-        return None
-    r.i16()  # size
+        return None, []
+    r.u16()  # size
     initial = r.i32()
     minimum = r.i32()
     maximum = r.i32()
-    return initial, minimum, maximum
+    images: List[int] = []
+    if r.remaining() >= 14:
+        try:
+            display_type = r.u16()
+            r.u16()  # flags
+            r.color()  # color1
+            r.color()  # color2
+            if display_type in (1, 4):
+                r.i16()  # font or flags
+                count = r.u16()
+                if 0 < count <= 64 and count * 2 <= r.remaining():
+                    raw = [r.u16() for _ in range(count)]
+                    images = [h for h in raw if h != 0xFFFF]
+        except Exception:  # noqa: BLE001
+            pass
+    return (initial, minimum, maximum), images
 
 
 def _read_object_common(r: Reader, two_five_plus: bool,
@@ -677,41 +696,51 @@ def _read_object_common(r: Reader, two_five_plus: bool,
     identifier = ""
     if two_five_plus:
         r.i32()  # size
-        anim_off = r.i16()
-        mov_off = r.i16()
+        anim_off = r.u16()
+        mov_off = r.u16()
         r.u16()  # version
         r.skip(2)
         r.i16()  # extension offset
-        counter_off = r.i16()
+        counter_off = r.u16()
     elif build >= 284:
         # MMF2 build 284+ (FNaF 1's layout): size, 2 skipped bytes, then a
-        # peeked "check" word that distinguishes two field orders.  Both
-        # orders continue *right after the size field* — the check is a
-        # peek, so seek back before reading the offsets (CTFAK seeks to
-        # currentPosition + 4 here; skipping that leaves every offset
-        # shifted by 2 bytes and the animations unreadable).
+        # peeked "check" word that distinguishes two field orders.  Static
+        # Active objects with no movements and version 0 also have check==0,
+        # so verify whether +4 is zero (counter_off) or identifier is a
+        # counter type before switching to the counter-first layout.
         r.i32()  # size
-        r.skip(2)
+        first_off = r.u16()
         check = r.i32()
         r.seek(start + 4)
+        use_counter_first = False
         if build == 284 and check == 0:
-            counter_off = r.i16()
+            if first_off == 0:
+                use_counter_first = True
+            elif start + 50 <= len(r):
+                pos = r.tell()
+                r.seek(start + 46)
+                peek_id = r.ascii(4)
+                r.seek(pos)
+                if peek_id in ("XT", "CNTR", "SCOR", "SCORE", "LIVE", "LIVES", "CN"):
+                    use_counter_first = True
+        if use_counter_first:
+            counter_off = r.u16()
             r.i32()  # version
-            mov_off = r.i16()
+            mov_off = r.u16()
             r.i16()  # extension offset
-            anim_off = r.i16()
+            anim_off = r.u16()
         else:
-            anim_off = r.i16()
-            mov_off = r.i16()
+            anim_off = r.u16()
+            mov_off = r.u16()
             r.i32()  # version
             r.i16()  # extension offset
-            counter_off = r.i16()
+            counter_off = r.u16()
     else:
         r.i32()  # size
-        mov_off = r.i16()
-        anim_off = r.i16()
+        mov_off = r.u16()
+        anim_off = r.u16()
         r.i16()  # version
-        counter_off = r.i16()
+        counter_off = r.u16()
         r.i16()  # system object offset
         r.skip(2)
     r.u16()  # flags
@@ -722,8 +751,8 @@ def _read_object_common(r: Reader, two_five_plus: bool,
         r.i16()  # extension offset
     else:
         r.i16()  # system object offset
-    values_off = r.i16()
-    strings_off = r.i16()
+    values_off = r.u16()
+    strings_off = r.u16()
     r.u16()  # new flags
     r.u16()  # preferences
     identifier = r.ascii(4) if two_five_plus or build >= 284 else r.ascii(2)
@@ -731,36 +760,36 @@ def _read_object_common(r: Reader, two_five_plus: bool,
     r.u32()  # fade in offset
     r.u32()  # fade out offset
 
-    if anim_off > 0:
+    if anim_off > 0 and start + anim_off < len(r):
         try:
             r.seek(start + anim_off)
             props.animations = _read_animations(r)
         except Exception:  # noqa: BLE001
             pass
-    if values_off > 0:
+    if values_off > 0 and start + values_off < len(r):
         try:
             r.seek(start + values_off)
             props.values = _read_alterable_values(r)
         except Exception:  # noqa: BLE001
             pass
-    if strings_off > 0:
+    if strings_off > 0 and start + strings_off < len(r):
         try:
             r.seek(start + strings_off)
             props.strings = _read_alterable_strings(r)
         except Exception:  # noqa: BLE001
             pass
-    if mov_off > 0:
+    if mov_off > 0 and start + mov_off < len(r):
         try:
             r.seek(start + mov_off)
             props.movements = _read_movements(r, unicode=False)
         except Exception:  # noqa: BLE001
             pass
-    if counter_off > 0 and identifier in (
-        "XT", "CNTR", "SCORE", "LIVE", "CN", "LIVES",
+    if counter_off > 0 and start + counter_off < len(r) and identifier in (
+        "XT", "CNTR", "SCOR", "SCORE", "LIVE", "CN", "LIVES",
     ):
         try:
             r.seek(start + counter_off)
-            props.counter = _read_counter(r)
+            props.counter, props.counter_images = _read_counter(r)
         except Exception:  # noqa: BLE001
             pass
     return props
@@ -774,9 +803,9 @@ def _read_quickbackdrop(r: Reader) -> _ObjectProps:
         r.i16()  # collision type
         props.width = r.i32()
         props.height = r.i32()
-        r.i16()  # border size
-        r.color()  # border color
         shape_type = r.i16()
+        border_size = r.i16()
+        r.color()  # border color
         fill_type = r.i16()
         if shape_type == 1:
             r.i16()
@@ -786,7 +815,8 @@ def _read_quickbackdrop(r: Reader) -> _ObjectProps:
             props.fill_color = r.color()
             r.color()
             r.i16()
-        props.image = r.i16()
+        elif fill_type == 3:
+            props.image = r.i16()
     except Exception:  # noqa: BLE001
         pass
     return props
@@ -1075,6 +1105,8 @@ class _GameReader:
         if props.counter is not None:
             obj.extra["value"], obj.extra["minimum"], obj.extra["maximum"] = \
                 props.counter
+        if props.counter_images:
+            obj.images = list(props.counter_images)
         first_image = None
         for anim in props.animations:
             for d in anim.directions:
@@ -1083,17 +1115,25 @@ class _GameReader:
                         first_image = h
         if first_image is not None:
             obj.image_handle = first_image
+        elif props.counter_images:
+            obj.image_handle = props.counter_images[0]
         elif props.image is not None and props.image != -1:
             obj.image_handle = props.image
         elif props.fill_color is not None:
-            # Quick backdrop with a solid fill: synthesize a tiny PNG so the
-            # object still appears in Scratch.
-            rgba = bytes(props.fill_color) * 4  # 2x2 px
-            png = encode_png(2, 2, rgba)
+            # Quick backdrop with a solid fill: synthesize a PNG at the
+            # object's dimensions so it renders at the right size in Scratch.
+            w = max(1, min(props.width or 32, 1920))
+            h = max(1, min(props.height or 32, 1080))
+            r_c, g_c, b_c = props.fill_color[:3]
+            a_c = props.fill_color[3] if len(props.fill_color) > 3 else 255
+            if a_c == 0:
+                a_c = 255
+            rgba = bytes((r_c, g_c, b_c, a_c)) * (w * h)
+            png = encode_png(w, h, rgba)
             if png:
                 synth = -1000000 - obj.handle
                 self.images[synth] = ImageItem(
-                    synth, 0, 0, len(png), 2, 2, 4, 0, 1, 1, 1, 1,
+                    synth, 0, 0, len(png), w, h, 4, 0, 0, 0, 0, 0,
                     props.fill_color, png, png)
                 obj.image_handle = synth
 
@@ -1235,6 +1275,7 @@ class _GameReader:
                     else:
                         self._read_image_normal(r)
                 except GameDataError as exc:
+                    after_failed = r.tell()
                     # A few 2.5+ games still carry classic-format images;
                     # fall back instead of giving up on the whole bank.
                     if self.two_five_plus:
@@ -1243,7 +1284,10 @@ class _GameReader:
                             self._read_image_normal(r)
                             continue
                         except GameDataError:
-                            pass
+                            # Restore cursor past the 2.5+ entry if it was
+                            # already consumed so the next image stays aligned.
+                            if after_failed > start:
+                                r.seek(after_failed)
                     self.warning(f"image at {start} unreadable: {exc}")
                 if r.remaining() <= 0:
                     break
@@ -1276,7 +1320,7 @@ class _GameReader:
             handle = r.i32()
         except EOFError as exc:
             raise GameDataError(f"truncated image header: {exc}") from exc
-        if self.build >= 284:
+        if self.build >= 284 and handle > 0:
             handle -= 1
         decomp_size = r.i32()
         comp_size = r.i32()
@@ -1306,13 +1350,18 @@ class _GameReader:
             raise GameDataError(
                 f"image {handle} inner header truncated: {exc}") from exc
         body = b""
-        if flags & 0x08:  # LZX: one zlib stream for the rest of the item
-            ir.i32()  # decompressed size
+        if flags & 0x08:  # LZX: zlib or LZ4 stream for the rest of the item
+            decomp = ir.i32()  # decompressed size
+            rest = ir.read(-1)
             try:
-                body = zlib_decompress_bounded(ir.read(-1),
-                                               _IMAGE_MAX_BYTES)
+                body = zlib_decompress_bounded(rest, _IMAGE_MAX_BYTES)
             except (zlib.error, DecompressionLimitError):
-                body = b""
+                try:
+                    body = lz4_block_decompress(
+                        rest, max(decomp, 0), tolerant=True)
+                except Exception:  # noqa: BLE001
+                    ir.seek(32)
+                    body = ir.read(max(size, 0))
         else:
             body = ir.read(max(size, 0))
         self._image_to_item(handle, checksum, references, size, width, height,
@@ -1345,10 +1394,19 @@ class _GameReader:
                 f"decompressed={decomp_size})"
             )
         raw = r.read(max(data_size - 4, 0))
-        try:
-            pixels = lz4_block_decompress(raw, decomp_size)
-        except Exception as exc:  # noqa: BLE001
-            raise GameDataError(f"image {handle} LZ4: {exc}") from exc
+        pixels = None
+        if len(raw) == decomp_size and not (flags & 0x08):
+            pixels = raw
+        if pixels is None:
+            try:
+                pixels = lz4_block_decompress(raw, decomp_size)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    pixels = lz4_block_decompress(raw, decomp_size, tolerant=True)
+                except Exception:
+                    pixels = None
+                if not pixels:
+                    raise GameDataError(f"image {handle} LZ4: {exc}") from exc
         try:
             png = decode_bmp(width, height, gmode, flags & ~0x08, pixels,
                              transparent)
@@ -1565,24 +1623,30 @@ class _GameReader:
         decryptor = _Decryptor(self.build)
         self.decryptor = decryptor
 
-        # Pre-pass: pull the key materials out of the (rarely encrypted)
-        # string chunks so encrypted chunks can be decoded immediately.
-        for chunk in chunks:
-            if chunk.id not in (CHUNK_APP_NAME, CHUNK_COPYRIGHT,
-                                CHUNK_EDITOR_FILENAME, CHUNK_TARGET_FILENAME):
-                continue
-            data = _decode_chunk(chunk, decryptor, self.name, self.copyright,
-                                 self.editor_filename, self.warnings)
-            if data is None:
-                continue
-            if chunk.id == CHUNK_APP_NAME:
-                self._read_app_name(data)
-            elif chunk.id == CHUNK_COPYRIGHT:
-                self.copyright = _cstring(Reader(data), self.unicode)
-            elif chunk.id == CHUNK_EDITOR_FILENAME:
-                self.editor_filename = _cstring(Reader(data), self.unicode)
-            elif chunk.id == CHUNK_TARGET_FILENAME:
-                self.target_filename = _cstring(Reader(data), self.unicode)
+        # Pre-pass: pull the key materials out of plain/compressed string
+        # chunks first, then any encrypted ones, so an encrypted chunk earlier
+        # in the stream cannot corrupt key fields before the others are read.
+        key_cids = (CHUNK_APP_NAME, CHUNK_COPYRIGHT,
+                    CHUNK_EDITOR_FILENAME, CHUNK_TARGET_FILENAME)
+        for encrypted_pass in (False, True):
+            for chunk in chunks:
+                if chunk.id not in key_cids:
+                    continue
+                is_enc = chunk.flags in (2, 3)
+                if is_enc != encrypted_pass:
+                    continue
+                data = _decode_chunk(chunk, decryptor, self.name, self.copyright,
+                                     self.editor_filename, self.warnings)
+                if data is None:
+                    continue
+                if chunk.id == CHUNK_APP_NAME and not self.name:
+                    self._read_app_name(data)
+                elif chunk.id == CHUNK_COPYRIGHT and not self.copyright:
+                    self.copyright = _cstring(Reader(data), self.unicode)
+                elif chunk.id == CHUNK_EDITOR_FILENAME and not self.editor_filename:
+                    self.editor_filename = _cstring(Reader(data), self.unicode)
+                elif chunk.id == CHUNK_TARGET_FILENAME and not self.target_filename:
+                    self.target_filename = _cstring(Reader(data), self.unicode)
 
         header_25 = names_25 = props_25 = None
         frame_chunks = []

@@ -102,16 +102,7 @@ def _read_parameter(r: Reader) -> Optional[Parameter]:
     # payload bytes INCLUDE nothing from before code... wait:
     #   read size (2 bytes)  # not counted in subsequent reads toward p_size?
     #   Actually: start; size=i16; code=i16; payload=read(p_size-2); seek(start+p_size)
-    #   Bytes consumed before seek: 2 + 2 + (p_size-2) = p_size+2
-    #   seek to start+p_size moves BACK 2 bytes.
-    # So every parameter over-reads 2 bytes into the next parameter, then
-    # seeks back. The payload therefore contains the real payload PLUS the
-    # first 2 bytes of the next parameter (or padding). That is messy but
-    # _decode_parameter_payload only reads what it needs from the start of
-    # payload, so it still works!
-    #
-    # Match MFA behaviour exactly so decoding stays consistent.
-    payload = r.read(max(size - 2, 0))
+    payload = r.read(max(size - 4, 0))
     r.seek(start + size)
     return Parameter(code, size, _decode_parameter_payload(code, payload), payload)
 
@@ -341,8 +332,12 @@ def normalize_exe_opcodes(group: EventGroup) -> EventGroup:
     for cond in group.conditions:
         n = cond.num
         if cond.object_type == -1:
+            # EXE Always is (-1, -1) while MFA Start-of-Frame is (-1, -1);
+            # normalize EXE Always onto -13 so the transpiler separates them.
+            if n == -1:
+                cond.num = -13
             # Global value int/double compare variants -> CompareGlobalValue
-            if n in (-28, -29, -30, -31, -32, -33, -34, -35, -36, -37, -38, -39):
+            elif n in (-28, -29, -30, -31, -32, -33, -34, -35, -36, -37, -38, -39):
                 cond.num = -8
         if cond.object_type != -1 and n in (-42, -43):
             cond.num = -27  # Alterable value
