@@ -112,7 +112,7 @@ def _read_condition(r: Reader) -> Optional[Condition]:
         return None
     start = r.tell()
     size = r.u16()
-    if size < 12:
+    if size < 12 or start + size > len(r):
         return None
     obj_type = r.i16()
     num = r.i16()
@@ -123,13 +123,16 @@ def _read_condition(r: Reader) -> Optional[Condition]:
     num_params = r.u8()
     def_type = r.u8()
     identifier = r.i16()
+    end = start + size
     params: List[Parameter] = []
     for _ in range(num_params):
+        if r.tell() >= end:
+            break
         p = _read_parameter(r)
         if p is None:
             break
         params.append(p)
-    r.seek(start + size)
+    r.seek(end)
     return Condition(
         obj_type, num, object_info, object_info_list, flags, other_flags,
         num_params, def_type, identifier, size, params,
@@ -141,7 +144,7 @@ def _read_action(r: Reader) -> Optional[Action]:
         return None
     start = r.tell()
     size = r.u16()
-    if size < 12:
+    if size < 12 or start + size > len(r):
         return None
     obj_type = r.i16()
     num = r.i16()
@@ -151,13 +154,16 @@ def _read_action(r: Reader) -> Optional[Action]:
     other_flags = r.i8()
     num_params = r.u8()
     def_type = r.u8()
+    end = start + size
     params: List[Parameter] = []
     for _ in range(num_params):
+        if r.tell() >= end:
+            break
         p = _read_parameter(r)
         if p is None:
             break
         params.append(p)
-    r.seek(start + size)
+    r.seek(end)
     return Action(
         obj_type, num, object_info, object_info_list, flags, other_flags,
         num_params, def_type, size, params,
@@ -273,8 +279,9 @@ def read_exe_events(data: bytes, build: int = 0) -> Tuple[List[EventGroup], List
             end = r.tell() + size
             before = len(groups)
             while r.tell() < end and r.remaining() > 0:
+                pos_before = r.tell()
                 eg = _read_event_group(r, build)
-                if eg is None:
+                if eg is None or r.tell() <= pos_before:
                     # Resync: stop this body rather than spinning.
                     warnings.append(
                         f"stopped reading event groups at offset {r.tell()}"
@@ -300,8 +307,9 @@ def read_exe_events(data: bytes, build: int = 0) -> Tuple[List[EventGroup], List
             if not saw_header and not groups:
                 r.seek(r.tell() - 4)
                 while (r.remaining() >= 12 and len(groups) < _MAX_EVENT_GROUPS):
+                    pos_before = r.tell()
                     eg = _read_event_group(r, build)
-                    if eg is None:
+                    if eg is None or r.tell() <= pos_before:
                         break
                     groups.append(eg)
                 if len(groups) >= _MAX_EVENT_GROUPS:

@@ -1751,6 +1751,8 @@ class _GameReader:
         if self.progress is not None and frame_chunks:
             self.progress.phase("frames", total=len(frame_chunks))
         for idx, chunk in enumerate(frame_chunks, start=1):
+            if self.progress is not None:
+                self.progress.step(f"decoding frame {idx}/{len(frame_chunks)}")
             data = self._decoded(
                 chunk, decryptor,
                 on_progress=(
@@ -1760,6 +1762,8 @@ class _GameReader:
                     else None
                 ))
             if data is None:
+                if self.progress is not None:
+                    self.progress.tick(idx)
                 continue
             if self.progress is not None:
                 self.progress.step(f"parsing frame {idx}/{len(frame_chunks)}")

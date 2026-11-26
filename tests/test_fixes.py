@@ -26,6 +26,7 @@ from cts2.mfa import (
     Parameter,
     _decode_parameter_payload,
     _read_condition,
+    _read_frame_events,
 )
 from cts2.progress import Reporter
 from cts2.scratch import TargetBuilder, build_project
@@ -227,6 +228,22 @@ class TestGameDataAndMFAFixes(unittest.TestCase):
         )
         normalize_exe_opcodes(g)
         self.assertEqual(g.conditions[0].num, COND_ALWAYS)
+
+    def test_param_comparison_and_zero_size_expression_never_hang(self):
+        # ParamComparison (code=23): 2-byte operator followed by 10-byte int expression (value=42)
+        expr = struct.pack("<hhHi", -1, 0, 10, 42)
+        cmp_payload = struct.pack("<h", 1) + expr
+        decoded = _decode_parameter_payload(23, cmp_payload)
+        self.assertEqual(decoded["operator"], 1)
+        self.assertEqual(decoded["expressions"][0]["value"], 42)
+
+        # Zero-size or negative-size expression must terminate instead of spinning
+        bad_expr = struct.pack("<hhh", 1, -1, 0) + b"\x00" * 10
+        self.assertEqual(_decode_parameter_payload(22, bad_expr), {"expressions": []})
+
+        # Zero-size EventGroup inside Evts must not infinite-loop _read_frame_events
+        evts = b"\x01\x00\x00\x00" + b"Evts" + struct.pack("<I", 16) + b"\x00" * 16 + b"!DNE"
+        self.assertEqual(_read_frame_events(Reader(evts)), [])
 
 
 def _make_mfa(w: int, h: int, images: dict, frames: list) -> MFA:

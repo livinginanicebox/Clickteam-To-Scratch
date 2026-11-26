@@ -755,8 +755,10 @@ def read_expression(r: Reader) -> Optional[Expression]:
         return None
     if r.remaining() < 2:
         return None
-    size = r.i16()
-    payload_start = r.tell()
+    size = r.u16()
+    if size < 6 or start + size > len(r):
+        r.seek(len(r))
+        return None
     value: Any = None
     # decode simple payloads
     if size - 6 >= 4 and obj_type == -1:
@@ -773,17 +775,26 @@ def read_expression(r: Reader) -> Optional[Expression]:
         else:
             r.read(max(size - 6, 0))
     elif obj_type >= 2 or obj_type == -7:
-        r.i16()  # object info
-        r.i16()  # object info list
-        if num in (16, 19):
-            value = r.i16()
-        else:
-            r.i32()
-        r.read(max(size - 6 - (6 if num in (16, 19) else 8), 0))
-    else:
-        r.read(max(size - 6, 0))
+        if r.remaining() >= 4:
+            r.i16()  # object info
+            r.i16()  # object info list
+            if num in (16, 19) and r.remaining() >= 2:
+                value = r.i16()
+            elif r.remaining() >= 4:
+                r.i32()
     r.seek(start + size)
     return Expression(obj_type, num, size, value)
+
+
+def _read_expression_list(p: Reader) -> List[dict]:
+    vals: List[dict] = []
+    while p.remaining() >= 6 and len(vals) < 512:
+        before = p.tell()
+        expr = read_expression(p)
+        if expr is None or p.tell() <= before:
+            break
+        vals.append(expr.as_dict())
+    return vals
 
 
 def _decode_parameter_payload(code: int, payload: bytes) -> Any:
@@ -799,14 +810,13 @@ def _decode_parameter_payload(code: int, payload: bytes) -> Any:
             return {"string": _auto_cstr(payload)}
         if code in (14, 44):
             return {"keycode": p.i16()}
-        if code in (15, 22, 23, 27, 28, 45, 46, 52, 53, 54, 59, 62):
-            vals = []
-            while p.remaining() >= 6:
-                expr = read_expression(p)
-                if expr is None:
-                    break
-                vals.append(expr.as_dict())
-            return {"expressions": vals}
+        if code == 23:
+            if p.remaining() < 2:
+                return {"raw_len": len(payload)}
+            cmp_op = p.i16()
+            return {"operator": cmp_op, "expressions": _read_expression_list(p)}
+        if code in (15, 22, 27, 28, 45, 46, 52, 53, 54, 59, 62):
+            return {"expressions": _read_expression_list(p)}
         if code in (6, 7, 35, 36):
             return {"sample": p.i16()}
         if code == 24:
@@ -852,6 +862,8 @@ def _read_condition(r: Reader) -> Optional[Condition]:
     if r.remaining() < 12:
         return None
     size = r.u16()
+    if size < 12 or start + size > len(r):
+        return None
     obj_type = r.i16()
     num = r.i16()
     object_info = r.u16()
@@ -861,18 +873,21 @@ def _read_condition(r: Reader) -> Optional[Condition]:
     num_params = r.u8()
     def_type = r.u8()
     identifier = r.i16()
+    end = start + size
     params = []
     for _ in range(num_params):
-        if r.remaining() < 4:
+        if r.tell() + 4 > end or r.remaining() < 4:
             break
         p_start = r.tell()
-        p_size = r.i16()
+        p_size = r.u16()
+        if p_size < 4 or p_start + p_size > end:
+            break
         code = r.i16()
         payload_len = max(p_size - 4, 0)
         payload = r.read(payload_len)
         r.seek(p_start + p_size)
         params.append(Parameter(code, p_size, _decode_parameter_payload(code, payload), payload))
-    r.seek(start + size)
+    r.seek(end)
     return Condition(obj_type, num, object_info, object_info_list, flags, other_flags,
                      num_params, def_type, identifier, size, params)
 
@@ -882,6 +897,8 @@ def _read_action(r: Reader) -> Optional[Action]:
     if r.remaining() < 12:
         return None
     size = r.u16()
+    if size < 12 or start + size > len(r):
+        return None
     obj_type = r.i16()
     num = r.i16()
     object_info = r.u16()
@@ -890,18 +907,21 @@ def _read_action(r: Reader) -> Optional[Action]:
     other_flags = r.i8()
     num_params = r.u8()
     def_type = r.u8()
+    end = start + size
     params = []
     for _ in range(num_params):
-        if r.remaining() < 4:
+        if r.tell() + 4 > end or r.remaining() < 4:
             break
         p_start = r.tell()
-        p_size = r.i16()
+        p_size = r.u16()
+        if p_size < 4 or p_start + p_size > end:
+            break
         code = r.i16()
         payload_len = max(p_size - 4, 0)
         payload = r.read(payload_len)
         r.seek(p_start + p_size)
         params.append(Parameter(code, p_size, _decode_parameter_payload(code, payload), payload))
-    r.seek(start + size)
+    r.seek(end)
     return Action(obj_type, num, object_info, object_info_list, flags, other_flags,
                   num_params, def_type, size, params)
 
@@ -910,7 +930,10 @@ def _read_event_group(r: Reader) -> Optional[EventGroup]:
     start = r.tell()
     if r.remaining() < 12:
         return None
-    size = -r.i16()
+    raw_size = r.i16()
+    size = -raw_size if raw_size < 0 else raw_size
+    if size < 12 or start + size > len(r):
+        return None
     num_cond = r.u8()
     num_act = r.u8()
     flags = r.u16()
@@ -918,17 +941,24 @@ def _read_event_group(r: Reader) -> Optional[EventGroup]:
     restrict_cpt = r.i16()
     identifier = r.i16()
     undo = r.i16()
+    end = start + size
     conds = []
     for _ in range(num_cond):
+        if r.tell() >= end:
+            break
         c = _read_condition(r)
-        if c is not None:
-            conds.append(c)
+        if c is None:
+            break
+        conds.append(c)
     acts = []
     for _ in range(num_act):
+        if r.tell() >= end:
+            break
         a = _read_action(r)
-        if a is not None:
-            acts.append(a)
-    r.seek(start + size)
+        if a is None:
+            break
+        acts.append(a)
+    r.seek(end)
     return EventGroup(size, num_cond, num_act, flags, is_restricted, restrict_cpt,
                       identifier, undo, conds, acts)
 
@@ -943,12 +973,14 @@ def _read_frame_events(r: Reader) -> List[EventGroup]:
         name = r.ascii(4)
         if name == "Evts":
             length = r.u32()
-            end = r.tell() + length
+            end = min(r.tell() + length, len(r))
             while r.tell() < end and r.remaining() > 0:
+                before = r.tell()
                 g = _read_event_group(r)
-                if g is None:
+                if g is None or r.tell() <= before:
                     break
                 groups.append(g)
+            r.seek(end)
         elif name == "Rems":
             length = r.u32()
             try:
