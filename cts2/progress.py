@@ -120,6 +120,7 @@ class Reporter:
         self._lists_dirty = True      # warnings/notes changed since last shown
         self.history: List[dict] = []  # bounded event replay for SSE
         self._max_history = max_history
+        self._seq = 0
         self._finished = False
         self.stats: dict = {}
         self._emitted = 0
@@ -167,6 +168,8 @@ class Reporter:
         }
 
     def _record_locked(self, ev: dict) -> None:
+        self._seq += 1
+        ev["_seq"] = self._seq
         self.history.append(ev)
         if len(self.history) > self._max_history:
             del self.history[: len(self.history) - self._max_history]

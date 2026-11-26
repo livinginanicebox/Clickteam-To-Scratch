@@ -132,14 +132,22 @@ EXE_ACT_START_LOOP = 14
 EXE_ACT_STOP_LOOP = 15
 EXE_ACT_START_LOOP_FOR_EACH = 58
 
-# Active-object actions (EXE / MFA Active CRun ordering).
-ACT_DESTROY = 0
+# EXE Storyboard actions (object_type == -3)
+EXE_ACT_NEXT_FRAME = 0
+EXE_ACT_PREV_FRAME = 1
+EXE_ACT_JUMP_FRAME = 2
+EXE_ACT_END_APP = 4
+
+# Active-object actions (EXE / MFA Active CAct ordering).
+ACT_SET_POSITION_0 = 0
+ACT_SET_POSITION = 1
 ACT_SET_X = 2
 ACT_SET_Y = 3
-ACT_SET_POSITION = 4
-ACT_SET_ANIM_FRAME = 12
-ACT_SHOW = 24
-ACT_HIDE = 25
+ACT_SET_ANIM_FRAME = 17
+ACT_SET_ANIM_FRAME_ALT = 12
+ACT_HIDE = 22
+ACT_SHOW = 23
+ACT_DESTROY = 24
 
 # Active-object conditions.
 # EXE stores these as negative nums on object_type=2; MFA fixtures may use
@@ -245,9 +253,28 @@ def _sprite_for(frame: Frame, object_info: int,
     return sprite_by_handle.get(object_info)
 
 
+def _sprites_for(frame: Frame, object_info: int, events_tb,
+                 sprite_by_handle: Dict[int, "TargetBuilder"]) -> list:
+    if object_info == 0:
+        return []
+    all_map = getattr(events_tb, "_all_sprites_by_handle", None)
+    if isinstance(all_map, dict) and object_info in all_map:
+        return list(all_map[object_info])
+    sp = sprite_by_handle.get(object_info)
+    return [sp] if sp is not None else []
+
+
 def _global_variable(events_tb, mfa: MFA, index: int, warnings: List[str],
                      strings: bool = False) -> Optional[str]:
     """Create/find a Scratch variable for a Clickteam global value/string."""
+    cache = getattr(events_tb, "_global_vars", None)
+    if cache is None:
+        cache = {}
+        events_tb._global_vars = cache
+    key = (strings, int(index))
+    if key in cache:
+        return cache[key]
+
     items = mfa.global_strings if strings else mfa.global_values
     if index <= 0 or index > len(items):
         # Out-of-range globals still get a variable so blocks do not dangle.
@@ -259,19 +286,22 @@ def _global_variable(events_tb, mfa: MFA, index: int, warnings: List[str],
     var_id = str(uuid.uuid4())
     value = 0 if not strings else ""
     try:
-        if index <= len(items):
+        if 1 <= index <= len(items):
             value = getattr(items[index - 1], "value", value)
     except Exception:  # noqa: BLE001
         pass
     events_tb.add_variable(var_id, label, value)
+    cache[key] = var_id
     if not label.startswith(("global value", "global string")):
         warnings.append(
             f"global {index} ('{label}') recreated as a Scratch variable")
     return var_id
 
 
-def _broadcast_name(frame: Frame, obj_name: str, kind: str, num: int) -> str:
-    return f"{frame.name} › {obj_name} › {kind} {num}"
+def _broadcast_name(frame: Frame, obj_name: str, kind: str, num: int,
+                    seq: Optional[int] = None) -> str:
+    base = f"{frame.name} › {obj_name} › {kind} {num}"
+    return f"{base} #{seq}" if seq is not None else base
 
 
 def _register_broadcast(tb, name: str) -> str:
@@ -348,13 +378,21 @@ def _mouse_down(tb) -> str:
 
 
 def _not(tb, operand: str) -> str:
-    return _add(tb, opcode="operator_not", inputs={"OPERAND": ref(operand)})
+    bid = _add(tb, opcode="operator_not", inputs={"OPERAND": ref(operand)})
+    if operand in tb.blocks:
+        tb.blocks[operand]["parent"] = bid
+    return bid
 
 
 def _join(tb, a, b) -> str:
-    return _add(tb, opcode="operator_join", inputs={
+    bid = _add(tb, opcode="operator_join", inputs={
         "STRING1": a if isinstance(a, list) else ref(a),
         "STRING2": b if isinstance(b, list) else ref(b)})
+    if not isinstance(a, list) and a in tb.blocks:
+        tb.blocks[a]["parent"] = bid
+    if not isinstance(b, list) and b in tb.blocks:
+        tb.blocks[b]["parent"] = bid
+    return bid
 
 
 def _touching(tb, sprite_name: str) -> str:
@@ -367,14 +405,22 @@ def _touching(tb, sprite_name: str) -> str:
 
 
 def _var_set(tb, var_id: str, var_name: str, value) -> str:
-    return _add(tb, opcode="data_setvariableto", fields={"VARIABLE": [var_name, var_id]},
-                inputs={"VALUE": value if isinstance(value, list) else ref(value)})
+    val_in = value if isinstance(value, list) else ref(value)
+    bid = _add(tb, opcode="data_setvariableto", fields={"VARIABLE": [var_name, var_id]},
+               inputs={"VALUE": val_in})
+    if not isinstance(value, list) and value in tb.blocks:
+        tb.blocks[value]["parent"] = bid
+    return bid
 
 
 def _var_change(tb, var_id: str, var_name: str, value) -> str:
-    return _add(tb, opcode="data_changevariableby",
-                fields={"VARIABLE": [var_name, var_id]},
-                inputs={"VALUE": value if isinstance(value, list) else ref(value)})
+    val_in = value if isinstance(value, list) else ref(value)
+    bid = _add(tb, opcode="data_changevariableby",
+               fields={"VARIABLE": [var_name, var_id]},
+               inputs={"VALUE": val_in})
+    if not isinstance(value, list) and value in tb.blocks:
+        tb.blocks[value]["parent"] = bid
+    return bid
 
 
 def _broadcast_block(tb, name: str, bid: str) -> str:
@@ -393,16 +439,21 @@ def _broadcast_block(tb, name: str, bid: str) -> str:
 
 class _Skeleton:
     def __init__(self, blocks: List[str], body_parent: str, body_is_substack: bool,
-                 approximation: Optional[str] = None):
+                 approximation: Optional[str] = None, prechained: bool = False,
+                 gate_block: Optional[str] = None,
+                 wrappers: Optional[List[str]] = None):
         self.blocks = blocks          # ids already added to tb
         self.body_parent = body_parent  # id the body chain should follow
         self.body_is_substack = body_is_substack  # True → SUBSTACK input
         self.approximation = approximation
+        self.prechained = prechained
+        self.gate_block = gate_block
+        self.wrappers = wrappers or []
 
 
 def _skel_flag(tb) -> _Skeleton:
     hat = _hat_flag(tb)
-    return _Skeleton([hat], hat, False)
+    return _Skeleton([hat], hat, False, prechained=True)
 
 
 def _skel_forever(tb) -> _Skeleton:
@@ -411,7 +462,7 @@ def _skel_forever(tb) -> _Skeleton:
     tb.blocks[body] = _block("control_forever")
     tb.blocks[hat]["next"] = body
     tb.blocks[body]["parent"] = hat
-    return _Skeleton([hat, body], body, True)
+    return _Skeleton([hat, body], body, True, prechained=True)
 
 
 def _skel_forever_if(tb, cond_id: str, approximation: Optional[str] = None) -> _Skeleton:
@@ -433,7 +484,8 @@ def _skel_forever_if(tb, cond_id: str, approximation: Optional[str] = None) -> _
     if cond_id in tb.blocks:
         tb.blocks[cond_id]["parent"] = inner
     return _Skeleton([hat, forever, inner], inner, True,
-                     approximation=approximation)
+                     approximation=approximation, prechained=True,
+                     gate_block=inner, wrappers=[hat, forever])
 
 
 def _skel_every(tb, frame: Frame, params: List[dict], warnings: List[str]) -> _Skeleton:
@@ -454,7 +506,9 @@ def _skel_every(tb, frame: Frame, params: List[dict], warnings: List[str]) -> _S
     tb.blocks[hat]["next"] = body
     tb.blocks[body]["parent"] = hat
     wait = _wait(tb, max(secs, 0.01))
-    return _Skeleton([hat, body, wait], wait, False)
+    tb.blocks[body]["inputs"]["SUBSTACK"] = ref(wait)
+    tb.blocks[wait]["parent"] = body
+    return _Skeleton([hat, body, wait], wait, False, prechained=True)
 
 
 def _skel_global_compare(tb, cond, frame, mfa, params, warnings, notes,
@@ -473,9 +527,10 @@ def _skel_global_compare(tb, cond, frame, mfa, params, warnings, notes,
         notes.append("global compare without a global index — kept as a note")
         return None
     var_id = _global_variable(tb, mfa, idx, warnings, strings=strings)
+    var_name = tb.variables[var_id][0]
     val = _expr_or_number(params)
     eq_id = _add(tb, opcode="operator_equals", inputs={
-        "OPERAND1": var_reference(var_id),
+        "OPERAND1": var_reference(var_id, var_name),
         "OPERAND2": num(val) if val is not None else num(0)})
     return _skel_forever_if(
         tb, eq_id,
@@ -588,12 +643,11 @@ def _compile_system_condition(tb, cond: Condition, frame: Frame,
             notes.append("Repeat without a readable count — kept as a note")
             return None
         hat = _hat_flag(tb)
-        body = _nid()
         rep = _add(tb, opcode="control_repeat", inputs={
-            "TIMES": num(int(count)), "SUBSTACK": ref(body)})
+            "TIMES": num(int(count)), "SUBSTACK": None})
         tb.blocks[hat]["next"] = rep
         tb.blocks[rep]["parent"] = hat
-        return _Skeleton([hat, rep], body, True)
+        return _Skeleton([hat, rep], rep, True, prechained=True)
 
     if n == COND_ON_KEY_PRESSED:
         key = _keycode_to_scratch(_first_number(params, ("keycode", "short", "int")))
@@ -705,11 +759,52 @@ def _compile_condition(tb, cond: Condition, frame: Frame, mfa: MFA,
 # --------------------------------------------------------------------------
 
 def _compile_action(tb, act: Action, frame: Frame, mfa: MFA,
-                    sprite_by_handle, warnings, notes) -> Optional[str]:
+                    sprite_by_handle, warnings, notes,
+                    act_seq: int = 0) -> Optional[str]:
     """Return the block id to run for ``act`` (may be a broadcast)."""
     params = _param_values(act)
     n = act.num
     obj_name = _obj_name(frame, act.object_info)
+
+    if act.object_type == STORYBOARD:
+        fidx = getattr(tb, "_frame_index", 0)
+        if n == EXE_ACT_NEXT_FRAME:
+            target_idx = min(fidx + 1, max(len(mfa.frames) - 1, 0))
+            h_bid = _register_broadcast(tb, "frame:hide_all")
+            s_bid = _register_broadcast(tb, f"frame:{target_idx}")
+            hb = _broadcast_block(tb, "frame:hide_all", h_bid)
+            sb_blk = _broadcast_block(tb, f"frame:{target_idx}", s_bid)
+            _chain(tb, [hb, sb_blk])
+            return hb
+        if n == EXE_ACT_PREV_FRAME:
+            target_idx = max(fidx - 1, 0)
+            h_bid = _register_broadcast(tb, "frame:hide_all")
+            s_bid = _register_broadcast(tb, f"frame:{target_idx}")
+            hb = _broadcast_block(tb, "frame:hide_all", h_bid)
+            sb_blk = _broadcast_block(tb, f"frame:{target_idx}", s_bid)
+            _chain(tb, [hb, sb_blk])
+            return hb
+        if n == EXE_ACT_JUMP_FRAME:
+            target = _expr_or_number(params)
+            if target is None:
+                return None
+            # Storyboard frame handle/index: clamp into valid range.
+            target_idx = int(target)
+            if target_idx >= len(mfa.frames):
+                for idx, mf in enumerate(mfa.frames):
+                    if mf.handle == target_idx:
+                        target_idx = idx
+                        break
+            target_idx = max(0, min(target_idx, max(len(mfa.frames) - 1, 0)))
+            h_bid = _register_broadcast(tb, "frame:hide_all")
+            s_bid = _register_broadcast(tb, f"frame:{target_idx}")
+            hb = _broadcast_block(tb, "frame:hide_all", h_bid)
+            sb_blk = _broadcast_block(tb, f"frame:{target_idx}", s_bid)
+            _chain(tb, [hb, sb_blk])
+            return hb
+        if n == EXE_ACT_END_APP:
+            return _add(tb, opcode="control_stop", fields={"STOP_OPTION": ["all", None]})
+        return None
 
     if act.object_type == SYS:
         if n in (ACT_START_LOOP, EXE_ACT_START_LOOP):
@@ -781,35 +876,45 @@ def _compile_action(tb, act: Action, frame: Frame, mfa: MFA,
             var_id = _global_variable(tb, mfa, idx, warnings, strings=True)
             var_name = tb.variables[var_id][0]
             extra = _first_string(params) or ""
-            j = _join(tb, var_reference(var_id), text(extra))
+            j = _join(tb, var_reference(var_id, var_name), text(extra))
             return _var_set(tb, var_id, var_name, ref(j))
         return None
 
     if act.object_type in (ACTIVE, ACTIVE_MFA):
-        sprite = _sprite_for(frame, act.object_info, sprite_by_handle)
-        if sprite is None:
+        targets = _sprites_for(frame, act.object_info, tb, sprite_by_handle)
+        if not targets:
             notes.append(f"{obj_name}: action #{n} (no sprite) — kept as a note")
             return None
-        name = _broadcast_name(frame, obj_name, "act", n)
+        name = _broadcast_name(frame, obj_name, "act", n, seq=act_seq)
         bid = _register_broadcast(tb, name)
-        # Also register on the events sprite so the project-level broadcast
-        # list is complete (Scratch merges stage broadcasts).
-        _register_broadcast(tb, name)
-        # the receiving handler on the object sprite
-        _build_object_handler(sprite, name, bid, act, frame, warnings, notes)
+        any_built = False
+        for sprite in targets:
+            if _build_object_handler(sprite, name, bid, act, frame, warnings, notes):
+                any_built = True
+        if not any_built:
+            return None
         return _broadcast_block(tb, name, bid)
 
     notes.append(f"{obj_name}: action #{n} (unsupported object type) — kept as a note")
     return None
 
 
+def _to_scratch_xy(frame: Frame, x: Optional[float], y: Optional[float]):
+    fw = frame.size_x or 640
+    fh = frame.size_y or 480
+    scale = min(480.0 / fw, 360.0 / fh)
+    sx = (x - fw / 2.0) * scale if x is not None else None
+    sy = (fh / 2.0 - y) * scale if y is not None else None
+    return sx, sy
+
+
 def _build_object_handler(sprite, name: str, bid: str, act: Action, frame: Frame,
-                          warnings: List[str], notes: List[str]) -> None:
+                          warnings: List[str], notes: List[str]) -> bool:
     """Attach a ``when I receive <name>`` handler on the object sprite."""
     params = _param_values(act)
     n = act.num
     body_ids: List[str] = []
-    x = y = None
+    has_pos_param = any("x" in p and "y" in p for p in params)
     if n == ACT_DESTROY:
         hid = _add(sprite, opcode="looks_hide")
         body_ids.append(hid)
@@ -819,34 +924,42 @@ def _build_object_handler(sprite, name: str, bid: str, act: Action, frame: Frame
         x = _expr_or_number(params)
         if x is None:
             notes.append(f"{sprite.name}: Set X without a readable value — kept as a note")
-            return
-        body_ids.append(_add(sprite, opcode="motion_setx", inputs={"X": num(x)}))
+            return False
+        sx, _ = _to_scratch_xy(frame, x, None)
+        body_ids.append(_add(sprite, opcode="motion_setx", inputs={"X": num(sx)}))
     elif n == ACT_SET_Y:
         y = _expr_or_number(params)
         if y is None:
             notes.append(f"{sprite.name}: Set Y without a readable value — kept as a note")
-            return
-        body_ids.append(_add(sprite, opcode="motion_sety", inputs={"Y": num(y)}))
-    elif n == ACT_SET_POSITION:
-        x = _expr_or_number(params)
-        y = None
-        rest = params[1:] if len(params) > 1 else []
-        y = _expr_or_number(rest)
-        if x is None or y is None:
+            return False
+        _, sy = _to_scratch_xy(frame, None, y)
+        body_ids.append(_add(sprite, opcode="motion_sety", inputs={"Y": num(sy)}))
+    elif n in (ACT_SET_POSITION, ACT_SET_POSITION_0) and (n == ACT_SET_POSITION or has_pos_param):
+        px = py = None
+        for p in params:
+            if "x" in p and "y" in p:
+                px, py = float(p["x"]), float(p["y"])
+                break
+        if px is None or py is None:
+            px = _expr_or_number(params)
+            rest = params[1:] if len(params) > 1 else []
+            py = _expr_or_number(rest)
+        if px is None or py is None:
             notes.append(f"{sprite.name}: Set position without readable X/Y — kept as a note")
-            return
+            return False
+        sx, sy = _to_scratch_xy(frame, px, py)
         body_ids.append(_add(sprite, opcode="motion_gotoxy",
-                             inputs={"X": num(x), "Y": num(y)}))
-    elif n == ACT_SET_ANIM_FRAME:
+                             inputs={"X": num(sx), "Y": num(sy)}))
+    elif n in (ACT_SET_ANIM_FRAME, ACT_SET_ANIM_FRAME_ALT):
         frame_no = _expr_or_number(params)
-        if frame_no is None or frame_no < 1:
+        if frame_no is None or frame_no < 0:
             notes.append(f"{sprite.name}: Set animation frame without a readable index")
-            return
+            return False
         costumes = sprite.costumes
         if not costumes:
-            return
-        idx = min(int(frame_no), len(costumes))
-        cname = costumes[idx - 1]["name"] if idx >= 1 else costumes[0]["name"]
+            return False
+        idx = max(1, min(int(frame_no) + (1 if int(frame_no) == 0 else 0), len(costumes)))
+        cname = costumes[idx - 1]["name"]
         body_ids.append(_add(sprite, opcode="looks_switchcostumeto",
                              fields={"COSTUME": [cname, None]}))
     elif n == ACT_SHOW:
@@ -855,11 +968,20 @@ def _build_object_handler(sprite, name: str, bid: str, act: Action, frame: Frame
         body_ids.append(_add(sprite, opcode="looks_hide"))
     else:
         notes.append(f"{sprite.name}: action #{n} — kept as a note")
-        return
+        return False
     if not body_ids:
-        return
+        return False
+    _register_broadcast(sprite, name)
     hat = _hat_broadcast(sprite, name, bid)
     _chain(sprite, [hat] + body_ids)
+    return True
+
+
+def _chain_tail(blocks: dict, first_id: str) -> str:
+    cur = first_id
+    while cur in blocks and blocks[cur].get("next"):
+        cur = blocks[cur]["next"]
+    return cur
 
 
 # --------------------------------------------------------------------------
@@ -875,6 +997,7 @@ def transpile_frame_blocks(frame: Frame, mfa: MFA, events_tb,
     """
     stats = {"groups": len(frame.event_groups), "mapped": 0, "unmapped": 0,
              "blocks": 0, "approximations": 0}
+    act_seq = 0
     for group in frame.event_groups:
         # 1) compile the conditions into a gating skeleton
         skeletons = []
@@ -895,8 +1018,9 @@ def transpile_frame_blocks(frame: Frame, mfa: MFA, events_tb,
         # 2) compile the actions into a body chain
         body_ids: List[str] = []
         for act in group.actions:
+            act_seq += 1
             bid = _compile_action(events_tb, act, frame, mfa, sprite_by_handle,
-                                  warnings, notes)
+                                  warnings, notes, act_seq=act_seq)
             if bid is not None:
                 body_ids.append(bid)
         if not body_ids and group.actions:
@@ -906,38 +1030,50 @@ def transpile_frame_blocks(frame: Frame, mfa: MFA, events_tb,
                 f"{frame.name}: event group with unmapped actions kept as a note")
             continue
 
-        # 3) stitch: chain each skeleton's own blocks, hang the body under
-        #    the LAST skeleton's body slot, then connect earlier skeletons
-        #    into the next one.
+        # 3) stitch: chain un-chained skeletons, nest any additional gated
+        #    conditions cleanly inside the primary script (never chaining a
+        #    second topLevel hat block), then attach the body chain.
         for sk in skeletons:
-            _chain(events_tb, sk.blocks)
-        primary = skeletons[-1]
+            if not sk.prechained:
+                _chain(events_tb, sk.blocks)
+
+        primary = skeletons[0]
+        for extra in skeletons[1:]:
+            if extra.gate_block and extra.gate_block in events_tb.blocks:
+                for wid in extra.wrappers:
+                    events_tb.blocks.pop(wid, None)
+                gate = extra.gate_block
+                events_tb.blocks[gate]["parent"] = primary.body_parent
+                if primary.body_is_substack:
+                    events_tb.blocks[primary.body_parent]["inputs"]["SUBSTACK"] = ref(gate)
+                else:
+                    events_tb.blocks[primary.body_parent]["next"] = gate
+                primary = _Skeleton(
+                    primary.blocks + [gate], gate, True,
+                    approximation=extra.approximation or primary.approximation,
+                    prechained=True, gate_block=gate,
+                )
+            else:
+                # Extra non-gated hat (e.g. redundant Always/Start-of-Frame):
+                # remove the extra topLevel wrapper blocks instead of nesting a hat.
+                for bid_rem in extra.blocks:
+                    if events_tb.blocks.get(bid_rem, {}).get("topLevel"):
+                        events_tb.blocks.pop(bid_rem, None)
+
         body_chain = body_ids
-        if primary.body_is_substack:
-            events_tb.blocks[primary.body_parent]["inputs"]["SUBSTACK"] = \
-                ref(body_chain[0]) if body_chain else None
-            if body_chain:
-                events_tb.blocks[body_chain[0]]["parent"] = primary.body_parent
-        else:
-            nxt = body_chain[0] if body_chain else None
-            events_tb.blocks[primary.body_parent]["next"] = nxt
-            if nxt is not None:
-                events_tb.blocks[nxt]["parent"] = primary.body_parent
         if body_chain:
             _chain(events_tb, body_chain)
-        # connect earlier skeletons into this one
-        for i in range(len(skeletons) - 1):
-            sk = skeletons[i]
-            first = skeletons[i + 1].blocks[0]
-            if sk.body_is_substack:
-                events_tb.blocks[sk.body_parent]["inputs"]["SUBSTACK"] = ref(first)
-                events_tb.blocks[first]["parent"] = sk.body_parent
+            if primary.body_is_substack:
+                events_tb.blocks[primary.body_parent]["inputs"]["SUBSTACK"] = ref(body_chain[0])
+                events_tb.blocks[body_chain[0]]["parent"] = primary.body_parent
             else:
-                events_tb.blocks[sk.body_parent]["next"] = first
-                events_tb.blocks[first]["parent"] = sk.body_parent
+                events_tb.blocks[primary.body_parent]["next"] = body_chain[0]
+                events_tb.blocks[body_chain[0]]["parent"] = primary.body_parent
+        elif primary.body_is_substack:
+            events_tb.blocks[primary.body_parent]["inputs"]["SUBSTACK"] = None
 
         stats["mapped"] += 1
-        stats["blocks"] += len(skeletons) + len(body_ids)
+        stats["blocks"] += len(primary.blocks) + len(body_ids)
         for sk in skeletons:
             if sk.approximation:
                 stats["approximations"] += 1

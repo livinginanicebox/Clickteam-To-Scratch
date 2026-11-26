@@ -27,8 +27,8 @@ def ref(block_id: str) -> list:
     return [2, block_id]
 
 
-def var_reference(var_id: str) -> list:
-    return [3, [12, "value", var_id], [10, ""]]
+def var_reference(var_id: str, var_name: str = "value") -> list:
+    return [3, [12, var_name, var_id], [10, ""]]
 
 
 def _block(opcode: str, next_id: Optional[str] = None, parent: Optional[str] = None,
@@ -292,8 +292,11 @@ def build_project(mfa: MFA, progress=None) -> tuple:
         assets[data] = png
 
     sprites: List[TargetBuilder] = []
-    for frame in mfa.frames:
-        _add_frame_sprites(mfa, frame, sprites, assets, report, progress)
+    for frame_idx, frame in enumerate(mfa.frames):
+        _add_frame_sprites(
+            mfa, frame, sprites, assets, report, progress,
+            frame_idx=frame_idx, multi_frame=len(mfa.frames) > 1,
+        )
     # make sure assets referenced are present
     for target in [stage] + sprites:
         for c in target.costumes:
@@ -314,19 +317,27 @@ def build_project(mfa: MFA, progress=None) -> tuple:
     progress.phase("transpile", total=sum(len(f.event_groups) for f in mfa.frames) or 1)
     done_groups = 0
     sprite_by_handle: Dict[int, TargetBuilder] = {}
+    all_sprites_by_handle: Dict[int, List[TargetBuilder]] = {}
     events_sprites: List[TargetBuilder] = []
-    for frame in mfa.frames:
-        _collect_sprite_handles(frame, sprites, sprite_by_handle)
+    for frame_idx, frame in enumerate(mfa.frames):
+        frame_sprite_map: Dict[int, TargetBuilder] = {}
+        frame_all_map: Dict[int, List[TargetBuilder]] = {}
+        _collect_sprite_handles(frame, sprites, frame_sprite_map, frame_all_map)
+        sprite_by_handle.update(frame_sprite_map)
+        all_sprites_by_handle.update(frame_all_map)
         events_tb = TargetBuilder(f"{frame.name}-Events")
-        data = events_tb.add_costume(_transparent_png(), "runner")
-        assets[data] = _transparent_png()
+        events_tb._all_sprites_by_handle = frame_all_map
+        events_tb._frame_index = frame_idx
+        t_png = _transparent_png()
+        data = events_tb.add_costume(t_png, "runner")
+        assets[data] = t_png
         events_sprites.append(events_tb)
         ev_notes: List[str] = []
         if frame.event_groups:
             progress.step(
                 f"frame '{frame.name}': {len(frame.event_groups)} event groups")
             stats = transpile_frame_blocks(
-                frame, mfa, events_tb, sprite_by_handle,
+                frame, mfa, events_tb, frame_sprite_map,
                 report["warnings"], ev_notes)
             report["blocks"] += stats["blocks"]
             report["events_mapped"] += stats["mapped"]
@@ -349,6 +360,7 @@ def build_project(mfa: MFA, progress=None) -> tuple:
     notes = _event_notes_svg(mfa)
     if notes:
         log_sprite = TargetBuilder("Logic-Notes")
+        log_sprite.visible = False
         data = log_sprite.add_costume_from_svg(notes, "events")
         assets[data] = notes
         sprites.append(log_sprite)
@@ -412,39 +424,99 @@ def _placeholder_png(width: int, height: int, name: str) -> bytes:
 
 
 def _collect_sprite_handles(frame: Frame, sprites: List[TargetBuilder],
-                            sprite_by_handle: Dict[int, TargetBuilder]) -> None:
-    """Map each frame item's handle to the sprite that represents it."""
-    seen: dict = {}
+                            sprite_by_handle: Dict[int, TargetBuilder],
+                            all_sprites_by_handle: Optional[Dict[int, List[TargetBuilder]]] = None) -> None:
+    """Map each frame item's handle to the sprite(s) that represent it."""
+    by_name = {sb.name: sb for sb in sprites}
     for inst in frame.instances:
         item = _find_item(frame, inst.item_handle)
         if item is None:
             continue
-        if item.handle in seen:
-            sprite_by_handle[item.handle] = seen[item.handle]
-            continue
-        name = _sprite_name(frame, item)
-        for sb in sprites:
-            if sb.name == name:
-                seen[item.handle] = sb
-                sprite_by_handle[item.handle] = sb
-                break
+        base = _sprite_name(frame, item)
+        matched: List[TargetBuilder] = []
+        if base in by_name:
+            matched.append(by_name[base])
+        idx = 2
+        while f"{base}_{idx}" in by_name:
+            matched.append(by_name[f"{base}_{idx}"])
+            idx += 1
+        if matched:
+            sprite_by_handle[item.handle] = matched[0]
+            if all_sprites_by_handle is not None:
+                all_sprites_by_handle[item.handle] = matched
 
 
 def _add_frame_sprites(mfa: MFA, frame: Frame, sprites: List[TargetBuilder],
-                       assets: Dict[str, bytes], report: dict, progress=None) -> None:
+                       assets: Dict[str, bytes], report: dict, progress=None,
+                       frame_idx: int = 0, multi_frame: bool = False) -> None:
     from .progress import NULL as _NULL
     progress = progress or _NULL
-    seen: dict = {}
-    total = len(frame.instances) or 1
-    for n, inst in enumerate(frame.instances, start=1):
+    seen_costumes: Dict[int, List[tuple]] = {}
+    seen_count: Dict[int, int] = {}
+    ordered = [
+        inst for _i, inst in sorted(
+            enumerate(frame.instances),
+            key=lambda pair: (getattr(pair[1], "layer", 0), pair[0]),
+        )
+    ]
+    total = len(ordered) or 1
+    for n, inst in enumerate(ordered, start=1):
         progress.tick(n, total, step=f"frame '{frame.name}': sprite {n}/{total}")
         item = _find_item(frame, inst.item_handle)
         if item is None:
             continue
+        src_item = item.handle
+        base_name = _sprite_name(frame, item)
+        if src_item in seen_costumes:
+            seen_count[src_item] += 1
+            sb = TargetBuilder(f"{base_name}_{seen_count[src_item]}")
+            for c_png, c_name, c_hx, c_hy in seen_costumes[src_item]:
+                sb.add_costume(c_png, c_name, c_hx, c_hy)
+            _add_sprite_scripts(
+                sb, frame, inst, item, len(sb.costumes),
+                frame_idx=frame_idx, multi_frame=multi_frame,
+            )
+            sprites.append(sb)
+            report["sprites"] += 1
+            continue
+
         visual = _item_image(mfa, item)
         png = visual.png if visual is not None else None
+        is_backdrop = getattr(item, "object_type", 2) in (0, 1)
+        is_non_visual = (
+            getattr(item, "object_type", 2) not in (0, 1, 2)
+            and not item.frames
+        )
+        costume_defs: List[tuple] = []
         if png:
-            hotspot = (visual.hotspot_x, visual.hotspot_y)
+            hotspot = (0, 0) if is_backdrop else (visual.hotspot_x, visual.hotspot_y)
+            sb = TargetBuilder(base_name)
+            asset = sb.add_costume(png, "costume1", *hotspot)
+            assets[asset] = png
+            costume_defs.append((png, "costume1", hotspot[0], hotspot[1]))
+            # Add unique remaining frames as costumes (in order of appearance).
+            seen_img_handles = {visual.handle}
+            c_idx = 2
+            for h in item.frames:
+                if h in seen_img_handles:
+                    continue
+                img = mfa.images.get(h)
+                if img and img.png:
+                    seen_img_handles.add(h)
+                    ihx, ihy = (0, 0) if is_backdrop else (img.hotspot_x, img.hotspot_y)
+                    cname = f"costume{c_idx}"
+                    a = sb.add_costume(img.png, cname, ihx, ihy)
+                    assets[a] = img.png
+                    costume_defs.append((img.png, cname, ihx, ihy))
+                    c_idx += 1
+        elif is_non_visual:
+            # Non-visual / text / controller objects without bitmap frames use
+            # an unobtrusive transparent costume instead of covering the stage.
+            t_png = _transparent_png()
+            sb = TargetBuilder(base_name)
+            asset = sb.add_costume(t_png, "costume1", 0, 0)
+            assets[asset] = t_png
+            costume_defs.append((t_png, "costume1", 0, 0))
         else:
             # Image missing or its pixel data did not decode.  Emit a visible
             # PNG placeholder instead of a blank / "?" costume.
@@ -452,35 +524,23 @@ def _add_frame_sprites(mfa: MFA, frame: Frame, sprites: List[TargetBuilder],
                 visual.width if visual else item.width,
                 visual.height if visual else item.height,
                 item.name)
-            hotspot = (0, 0)
             report["warnings"].append(
                 f"Object {item.name}: image missing/undecodable; used a "
                 f"PNG placeholder costume"
             )
-            png = None
-        src_item = item.handle
-        if src_item in seen:
-            sb = seen[src_item]
-        else:
-            sb = TargetBuilder(_sprite_name(frame, item))
-            if png:
-                asset = sb.add_costume(png, "costume1", *hotspot)
-                assets[asset] = png
-                # add rest of animations as costumes
-                for idx, h in enumerate(item.frames[1:], start=2):
-                    img = mfa.images.get(h)
-                    if img and img.png:
-                        a = sb.add_costume(
-                            img.png, f"costume{idx}", img.hotspot_x,
-                            img.hotspot_y)
-                        assets[a] = img.png
-            else:
-                asset = sb.add_costume(ph, "costume1", *hotspot)
-                assets[asset] = ph
-            _add_sprite_scripts(sb, frame, inst, item, len(item.frames))
-            seen[src_item] = sb
-            sprites.append(sb)
-            report["sprites"] += 1
+            sb = TargetBuilder(base_name)
+            asset = sb.add_costume(ph, "costume1", 0, 0)
+            assets[asset] = ph
+            costume_defs.append((ph, "costume1", 0, 0))
+
+        _add_sprite_scripts(
+            sb, frame, inst, item, len(costume_defs),
+            frame_idx=frame_idx, multi_frame=multi_frame,
+        )
+        seen_costumes[src_item] = costume_defs
+        seen_count[src_item] = 1
+        sprites.append(sb)
+        report["sprites"] += 1
 
 
 def _find_item(frame: Frame, handle: int) -> Optional[ObjectData]:
@@ -503,25 +563,47 @@ def _sprite_name(frame: Frame, item: ObjectData) -> str:
     return f"{frame.name}-{safe}".replace(" ", "")
 
 
+def _should_loop_animation(item: Optional[ObjectData], costumes: int) -> bool:
+    if costumes <= 1 or item is None:
+        return False
+    # Counters, scores, lives, text use frames as digits/states, not loops.
+    if getattr(item, "object_type", 2) in (0, 1, 3, 4, 5, 6, 7, 8, 9):
+        return False
+    anims = getattr(item, "animations", None) or []
+    if not anims:
+        return True
+    first_anim = anims[0]
+    dirs = getattr(first_anim, "directions", None) or []
+    if not dirs:
+        return False
+    # Clickteam repeat == 0 means loop infinitely; > 0 means finite repeats.
+    return getattr(dirs[0], "repeat", 0) == 0 and len(getattr(dirs[0], "frames", [])) > 1
+
+
 def _add_sprite_scripts(sb: TargetBuilder, frame: Frame, inst: FrameInstance,
-                        item: ObjectData, costumes: int) -> None:
+                        item: Optional[ObjectData], costumes: int,
+                        frame_idx: int = 0, multi_frame: bool = False) -> str:
     # Clickteam origin is top-left; Scratch origin is stage centre.
-    # Scale the frame into Scratch's 480x360 stage so objects land on-screen
-    # even when the Fusion window is 1280x720 (or any other size).
+    # Uniformly scale the frame into Scratch's 480x360 stage so sprites keep
+    # their aspect ratio and proportions even on 1280x720 or 640x480 games.
     fw = frame.size_x or 640
     fh = frame.size_y or 480
-    sx = (inst.x - fw / 2.0) * (480.0 / fw)
-    sy = (fh / 2.0 - inst.y) * (360.0 / fh)
+    scale = min(480.0 / fw, 360.0 / fh)
+    sx = (inst.x - fw / 2.0) * scale
+    sy = (fh / 2.0 - inst.y) * scale
     sb.x = sx
     sb.y = sy
+    sb.size = max(5.0, min(1000.0, round(scale * 100.0, 2)))
     # Honour the Clickteam object's initial visibility: an instance that
     # starts hidden must stay hidden (and appears only when the converted
     # events call `show`), instead of being force-shown at green flag.
-    visible = getattr(inst, "visible", True)
-    sb.visible = bool(visible)
+    # On multi-frame games, frames > 0 also start hidden until jumped to.
+    inst_visible = bool(getattr(inst, "visible", True))
+    start_visible = inst_visible if frame_idx == 0 else False
+    sb.visible = start_visible
     vis_id = _nid()
     sb.blocks[vis_id] = _block(
-        "looks_show" if visible else "looks_hide")
+        "looks_show" if start_visible else "looks_hide")
     gotoxy_id = _nid()
     sb.blocks[gotoxy_id] = _block(
         "motion_gotoxy", next_id=vis_id,
@@ -530,8 +612,8 @@ def _add_sprite_scripts(sb: TargetBuilder, frame: Frame, inst: FrameInstance,
     sb.blocks[vis_id]["parent"] = gotoxy_id
     hat = script_when_green_flag(sb.blocks, gotoxy_id)
     sb.blocks[gotoxy_id]["parent"] = hat
-    # animate if multiple costumes
-    if costumes > 1:
+    # Animate only if the first animation actually loops infinitely.
+    if _should_loop_animation(item, costumes):
         nxt = _nid()
         sb.blocks[nxt] = _block("looks_nextcostume")
         loop = _nid()
@@ -542,4 +624,26 @@ def _add_sprite_scripts(sb: TargetBuilder, frame: Frame, inst: FrameInstance,
         sb.blocks[nxt]["parent"] = loop
         sb.blocks[vis_id]["next"] = loop
         sb.blocks[loop]["parent"] = vis_id
+    if multi_frame:
+        show_bcast = f"frame:{frame_idx}"
+        hide_bcast = "frame:hide_all"
+        show_bid = sb.add_broadcast(show_bcast)
+        hide_bid = sb.add_broadcast(hide_bcast)
+        s_hat = _nid()
+        s_act = _nid()
+        sb.blocks[s_act] = _block("looks_show" if inst_visible else "looks_hide",
+                                  parent=s_hat)
+        sb.blocks[s_hat] = _block(
+            "event_whenbroadcastreceived", next_id=s_act,
+            fields={"BROADCAST_OPTION": [show_bcast, show_bid]},
+            toplevel=True, x=60, y=260,
+        )
+        h_hat = _nid()
+        h_act = _nid()
+        sb.blocks[h_act] = _block("looks_hide", parent=h_hat)
+        sb.blocks[h_hat] = _block(
+            "event_whenbroadcastreceived", next_id=h_act,
+            fields={"BROADCAST_OPTION": [hide_bcast, hide_bid]},
+            toplevel=True, x=60, y=420,
+        )
     return hat

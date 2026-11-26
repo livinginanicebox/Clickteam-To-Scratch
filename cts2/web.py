@@ -488,13 +488,17 @@ class _H(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             reporter = job["reporter"]
-            sent = 0
+            last_seq = 0
             sent_done = False
             while True:
                 with reporter._lock:
                     hist = list(reporter.history)
-                for ev in hist[sent:]:
-                    sent += 1
+                for ev in hist:
+                    seq = ev.get("_seq", 0)
+                    if seq and seq <= last_seq:
+                        continue
+                    if seq:
+                        last_seq = seq
                     if ev.get("type") == "done":
                         sent_done = True
                     self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
@@ -524,7 +528,7 @@ class _H(BaseHTTPRequestHandler):
             if "boundary=" not in ctype:
                 self._send(400, b"expected multipart upload", "text/plain")
                 return
-            boundary = ctype.split("boundary=", 1)[1].strip().encode()
+            boundary = ctype.split("boundary=", 1)[1].split(";", 1)[0].strip().strip('"').encode()
             if not raw.startswith(b"--" + boundary):
                 self._send(400, b"bad multipart body", "text/plain")
                 return
@@ -534,7 +538,8 @@ class _H(BaseHTTPRequestHandler):
                 header, sep, body = part.partition(b"\r\n\r\n")
                 if not sep:
                     continue
-                body = body.split(b"\r\n--")[0]
+                if body.endswith(b"\r\n"):
+                    body = body[:-2]
                 nm = b"filename="
                 if nm in header:
                     raw_name = header.split(nm, 1)[1].split(b"\r\n", 1)[0].strip().strip(b'"')

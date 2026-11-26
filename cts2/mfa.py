@@ -487,17 +487,16 @@ def _read_image_bank(r: Reader) -> Dict[int, ImageItem]:
     graphic_mode = r.i32()
     palette_version = r.i16()
     palette_entries = r.i16()
-    for _ in range(256):
-        r.color()
+    palette = [r.color() for _ in range(256)]
     count = r.i32()
     images: Dict[int, ImageItem] = {}
     for _ in range(max(count, 0)):
-        item = _read_image_item(r)
+        item = _read_image_item(r, palette=palette)
         images[item.handle] = item
     return images
 
 
-def _read_image_item(r: Reader) -> ImageItem:
+def _read_image_item(r: Reader, palette=None) -> ImageItem:
     handle = r.i32()
     checksum = r.i32()
     references = r.i32()
@@ -523,7 +522,8 @@ def _read_image_item(r: Reader) -> ImageItem:
     if body:
         # The LZX bit means the pixels came from an LZ4 block; the decoder just
         # produced the plain pixel/alpha stream, so clear it before decoding.
-        png = decode_bmp(width, height, gmode, flags & ~0x08, body, transparent)
+        png = decode_bmp(width, height, gmode, flags & ~0x08, body,
+                         transparent, palette=palette)
     return ImageItem(
         handle, checksum, references, size, width, height, gmode, flags, hx, hy, ax, ay, transparent, png, body
     )
@@ -730,6 +730,21 @@ EVENT_PARAM_NAMES = {
 }
 
 
+def _auto_cstr(raw: bytes) -> str:
+    """Decode a null-terminated string that may be UTF-16LE or latin-1."""
+    if not raw:
+        return ""
+    if len(raw) >= 4 and raw[0] != 0 and raw[1] == 0:
+        chars = []
+        for i in range(0, len(raw) - 1, 2):
+            c = raw[i] | (raw[i + 1] << 8)
+            if c == 0:
+                break
+            chars.append(chr(c))
+        return "".join(chars)
+    return raw.split(b"\x00", 1)[0].decode("latin-1", "replace")
+
+
 def read_expression(r: Reader) -> Optional[Expression]:
     start = r.tell()
     if r.remaining() < 4:
@@ -748,7 +763,7 @@ def read_expression(r: Reader) -> Optional[Expression]:
         if num == 0:
             value = r.i32()
         elif num == 3:
-            value = r.ascii()
+            value = _auto_cstr(r.read(max(size - 6, 0)))
         elif num == 23:
             value = r.f64()
             r.f32()
@@ -781,7 +796,7 @@ def _decode_parameter_payload(code: int, payload: bytes) -> Any:
         if code in (5, 25, 29, 34, 48, 56):
             return {"int": p.i32()}
         if code in (41, 64):
-            return {"string": p.ascii()}
+            return {"string": _auto_cstr(payload)}
         if code in (14, 44):
             return {"keycode": p.i16()}
         if code in (15, 22, 23, 27, 28, 45, 46, 52, 53, 54, 59, 62):
@@ -798,13 +813,29 @@ def _decode_parameter_payload(code: int, payload: bytes) -> Any:
             return {"colour": p.color()}
         if code == 49:
             r2 = Reader(payload)
-            r2.i32()
-            return {"global": r2.i32()}
+            if len(payload) >= 8:
+                r2.i32()
+                return {"global": r2.i32()}
+            if len(payload) >= 4:
+                return {"global": r2.i32()}
+            return {"global": r2.i16()}
         if code == 13:
             return {"every": p.i32()}
         if code == 32:
             return {"click": p.i16()}
-        if code in (1, 9, 21, 16, 18, 19, 40, 50, 55):
+        if code == 1 and len(payload) >= 6:
+            oi_list = p.i16()
+            oi = p.u16()
+            otype = p.i16()
+            return {"object_info": oi, "object_info_list": oi_list,
+                    "object_type": otype}
+        if code == 16 and len(payload) >= 8:
+            parent_info = p.u16()
+            p_flags = p.u16()
+            px = p.i16()
+            py = p.i16()
+            return {"x": px, "y": py, "parent": parent_info, "flags": p_flags}
+        if code in (9, 21, 18, 19, 40, 50, 55):
             # keep raw, decoding is uncertain on real projects
             return {"raw_len": len(payload)}
         # generic fallback: return as numbers when possible
@@ -832,12 +863,12 @@ def _read_condition(r: Reader) -> Optional[Condition]:
     identifier = r.i16()
     params = []
     for _ in range(num_params):
-        if r.remaining() < 2:
+        if r.remaining() < 4:
             break
         p_start = r.tell()
         p_size = r.i16()
         code = r.i16()
-        payload_len = max(p_size - 2, 0)
+        payload_len = max(p_size - 4, 0)
         payload = r.read(payload_len)
         r.seek(p_start + p_size)
         params.append(Parameter(code, p_size, _decode_parameter_payload(code, payload), payload))
@@ -861,12 +892,12 @@ def _read_action(r: Reader) -> Optional[Action]:
     def_type = r.u8()
     params = []
     for _ in range(num_params):
-        if r.remaining() < 2:
+        if r.remaining() < 4:
             break
         p_start = r.tell()
         p_size = r.i16()
         code = r.i16()
-        payload_len = max(p_size - 2, 0)
+        payload_len = max(p_size - 4, 0)
         payload = r.read(payload_len)
         r.seek(p_start + p_size)
         params.append(Parameter(code, p_size, _decode_parameter_payload(code, payload), payload))
